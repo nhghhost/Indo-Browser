@@ -1,0 +1,100 @@
+{
+  "name": "indo-browser",
+  "version": "0.1.0-beta.1",
+  "description": "Modern web browser with DRM support and privacy-focused features. No telemetry, no tracking.",
+  "main": "main.js",
+  "author": {
+    "name": "Naufal Haidar Putera Syarif",
+    "email": "naufalhaidar442@gmail.com"
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/yourusername/indo-browser#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nhghhost/Indo-Browser"
+  },
+  "keywords": [
+    "browser",
+    "electron",
+    "chromium",
+    "widevine",
+    "drm",
+    "privacy",
+    "no-telemetry",
+    "multi-tab"
+  ],
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron . --enable-logging",
+    "build": "electron-builder build --win --x64",
+    "build:dir": "electron-builder --dir",
+    "clean": "rmdir /s /q dist"
+  },
+  "build": {
+    "appId": "com.indo.browser",
+    "productName": "Indo Browser",
+    "copyright": "Copyright © 2026 ${author}",
+    "compression": "normal",
+    "asar": true,
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "renderer.js",
+      "index.html",
+      "styles.css",
+      "icon.ico",
+      "icon.png"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "icon.ico",
+      "requestedExecutionLevel": "asInvoker",
+      "artifactName": "${productName}-${version}-${os}-${arch}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "allowElevation": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Indo Browser",
+      "perMachine": false,
+      "deleteAppDataOnUninstall": false,
+      "installerIcon": "icon.ico",
+      "uninstallerIcon": "icon.ico",
+      "installerHeaderIcon": "icon.ico",
+      "license": "LICENSE.txt"
+    },
+    "portable": {
+      "artifactName": "${productName}-${version}-Portable.${ext}"
+    }
+  },
+  "devDependencies": {
+    "electron": "github:castlabs/electron-releases#v33.2.1+wvcus",
+    "electron-builder": "^24.13.3"
+  },
+  "dependencies": {
+    "node-fetch": "^2.7.0"
+  },
+  "engines": {
+    "node": ">=18.0.0",
+    "npm": ">=9.0.0"
+  }
+}

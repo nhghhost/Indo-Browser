@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Indo Browser</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: #f5f5f5;
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+        }
+
+        .toolbar {
+            background: #333;
+            padding: 10px 15px;
+            display: flex;
+            gap: 10px;
+            align-items: center;
+            box-shadow: 0 2px 5px rgba(0, 0, 0, 0.2);
+        }
+
+        button {
+            background: #0078d4;
+            color: white;
+            border: none;
+            padding: 8px 12px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+            transition: background 0.2s;
+        }
+
+        button:hover {
+            background: #106ebe;
+        }
+
+        button:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+        }
+
+        .address-bar {
+            flex: 1;
+            padding: 8px 12px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 14px;
+        }
+
+        .address-bar:focus {
+            outline: none;
+            border-color: #0078d4;
+            box-shadow: 0 0 0 2px rgba(0, 120, 212, 0.2);
+        }
+
+        .tabs-bar {
+            display: flex;
+            align-items: center;
+            background: #222;
+            padding: 4px 8px;
+            gap: 4px;
+            overflow-x: auto;
+        }
+
+        .tab {
+            background: #444;
+            color: #eee;
+            border: none;
+            padding: 6px 10px;
+            border-radius: 4px 4px 0 0;
+            cursor: pointer;
+            font-size: 13px;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .tab.active {
+            background: #fff;
+            color: #222;
+        }
+
+        .tab-title {
+            max-width: 120px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .tab-close {
+            background: transparent;
+            border: none;
+            color: inherit;
+            cursor: pointer;
+            font-size: 12px;
+        }
+
+        #new-tab-btn {
+            background: #333;
+            color: #eee;
+            border: none;
+            padding: 4px 8px;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+
+        /* ✅ PERUBAHAN: Content area jadi placeholder kosong */
+        .content {
+            flex: 1;
+            overflow: hidden;
+            background: white;
+            margin: 10px;
+            border-radius: 4px;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+            position: relative;
+            /* ✅ Penting buat positioning BrowserView */
+        }
+
+        /* ✅ HAPUS: webview style gak dipake lagi */
+
+        .loading-indicator {
+            display: none;
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background: rgba(0, 0, 0, 0.8);
+            color: white;
+            padding: 20px 40px;
+            border-radius: 8px;
+            font-size: 16px;
+            z-index: 1000;
+        }
+
+        .loading-indicator.show {
+            display: block;
+        }
+
+        .history-overlay {
+            position: fixed;
+            inset: 0;
+            background: rgba(0, 0, 0, 0.45);
+            display: none;
+            align-items: center;
+            justify-content: center;
+            z-index: 2000;
+        }
+
+        .history-overlay.show {
+            display: flex;
+        }
+
+        .history-panel {
+            width: 600px;
+            max-height: 70vh;
+            background: #fff;
+            border-radius: 8px;
+            box-shadow: 0 4px 18px rgba(0, 0, 0, 0.3);
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        .history-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 10px 14px;
+            background: #333;
+            color: #fff;
+            font-weight: 600;
+        }
+
+        .history-header button {
+            background: transparent;
+            padding: 4px 8px;
+            font-size: 14px;
+        }
+
+        .history-list {
+            padding: 8px 0;
+            overflow-y: auto;
+            background: #fafafa;
+        }
+
+        .history-item {
+            padding: 8px 12px;
+            border-bottom: 1px solid #eee;
+            cursor: pointer;
+        }
+
+        .history-item:hover {
+            background: #e6f2ff;
+        }
+
+        .history-item-title {
+            font-size: 14px;
+            font-weight: 500;
+            color: #222;
+        }
+
+        .history-item-url {
+            font-size: 12px;
+            color: #555;
+        }
+
+        .history-item-time {
+            font-size: 11px;
+            color: #999;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="toolbar">
+        <button id="back-btn">←</button>
+        <button id="forward-btn">→</button>
+        <button id="reload-btn">⟳</button>
+        <button id="home-btn">HOME</button>
+        <button id="devtools-btn">DevTools</button>
+
+        <input type="text" class="address-bar" id="url-input" placeholder="Enter URL (e.g., https://google.com)">
+
+        <button id="go-btn">GO</button>
+        <button id="history-btn">HISTORY</button>
+    </div>
+
+    <div class="tabs-bar" id="tabs-bar">
+        <button id="new-tab-btn">＋</button>
+    </div>
+
+    <!-- ✅ PERUBAHAN: Content kosong, BrowserView akan render di sini dari main process -->
+    <div class="content" id="content">
+        <!-- BrowserView dirender dari main.js, bukan dari HTML -->
+    </div>
+
+    <div class="loading-indicator" id="loading">
+        Loading...
+    </div>
+
+    <div class="history-overlay" id="history-overlay">
+        <div class="history-panel">
+            <div class="history-header">
+                <span>History</span>
+                <button id="history-close-btn">✕</button>
+            </div>
+            <div class="history-list" id="history-list">
+                <!-- Items akan di-render via JS -->
+            </div>
+        </div>
+    </div>
+
+    <script src="renderer.js"></script>
+</body>
+
+</html>
