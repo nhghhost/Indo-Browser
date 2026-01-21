@@ -8,10 +8,10 @@
     "email": "naufalhaidar442@gmail.com"
   },
   "license": "MIT",
-  "homepage": "https://github.com/yourusername/indo-browser#readme",
+  "homepage": "https://github.com/nhghhost/Indo-Browser#readme",
   "repository": {
     "type": "git",
-    "url": "https://github.com/nhghhost/Indo-Browser"
+    "url": "https://github.com/nhghhost/Indo-Browser.git"
   },
   "keywords": [
     "browser",
@@ -33,57 +33,34 @@
   "build": {
     "appId": "com.indo.browser",
     "productName": "Indo Browser",
-    "copyright": "Copyright © 2026 ${author}",
     "compression": "normal",
-    "asar": true,
-    "directories": {
-      "output": "dist",
-      "buildResources": "build"
-    },
+    "electronDist": "electron-cache",
+    "electronVersion": "33.2.1+wvcus",
     "files": [
       "main.js",
       "preload.js",
       "renderer.js",
       "index.html",
-      "styles.css",
-      "icon.ico",
-      "icon.png"
+      "history.json",
+      "icon.ico"
     ],
     "win": {
       "target": [
-        {
-          "target": "nsis",
-          "arch": [
-            "x64"
-          ]
-        },
-        {
-          "target": "portable",
-          "arch": [
-            "x64"
-          ]
-        }
+        "nsis",
+        "portable"
       ],
       "icon": "icon.ico",
-      "requestedExecutionLevel": "asInvoker",
-      "artifactName": "${productName}-${version}-${os}-${arch}.${ext}"
+      "sign": null,
+      "signingHashAlgorithms": []
     },
     "nsis": {
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
-      "allowElevation": true,
       "createDesktopShortcut": true,
-      "createStartMenuShortcut": true,
-      "shortcutName": "Indo Browser",
-      "perMachine": false,
-      "deleteAppDataOnUninstall": false,
-      "installerIcon": "icon.ico",
-      "uninstallerIcon": "icon.ico",
-      "installerHeaderIcon": "icon.ico",
-      "license": "LICENSE.txt"
+      "differentialPackage": false
     },
     "portable": {
-      "artifactName": "${productName}-${version}-Portable.${ext}"
+      "useZip": false
     }
   },
   "devDependencies": {
@@ -92,9 +69,5 @@
   },
   "dependencies": {
     "node-fetch": "^2.7.0"
-  },
-  "engines": {
-    "node": ">=18.0.0",
-    "npm": ">=9.0.0"
   }
 }
