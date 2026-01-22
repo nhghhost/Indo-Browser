@@ -1,30 +1,28 @@
-const { app, BrowserWindow, BrowserView, Menu, ipcMain } = require('electron');
+const { app, BrowserWindow, BrowserView, Menu, ipcMain, shell, session } = require('electron');
 const path = require('path');
 
 let mainWindow;
 const views = new Map();
 let activeViewId = null;
 
-// ✅ Widevine switches SEBELUM app.whenReady()
-app.commandLine.appendSwitch('enable-widevine-cdm');
-app.commandLine.appendSwitch('widevine-cdm-path', process.execPath);
+// Catatan:
+// - HAPUS total: ignore-certificate-errors, setCertificateVerifyProc(callback(0)), dan spoofing header sec-ch-ua.
+// - Biarkan TLS verify normal (default) supaya situs login (Google) percaya. [page:3]
 
-// ✅ Media/Audio permissions
-app.commandLine.appendSwitch('--enable-features',
-    'DnsOverHttps,NetworkService,NetworkServiceInProcess,EncryptedClientHello,MediaEngagementBypassAutoplayPolicies'
-);
-app.commandLine.appendSwitch('--autoplay-policy', 'no-user-gesture-required');
+function isGoogleHost(hostname) {
+    return (
+        hostname === 'google.com' ||
+        hostname.endsWith('.google.com') ||
+        hostname === 'gmail.com' ||
+        hostname.endsWith('.gmail.com') ||
+        hostname === 'googleusercontent.com' ||
+        hostname.endsWith('.googleusercontent.com')
+    );
+}
 
-// DNS & SSL switches
-app.commandLine.appendSwitch('--dns-over-https-server', 'https://1.1.1.1/dns-query');
-app.commandLine.appendSwitch('--disable-dns-prefetch');
-app.commandLine.appendSwitch('ignore-certificate-errors');
-app.commandLine.appendSwitch('--ssl-version-min', 'tls1.2');
-app.commandLine.appendSwitch('--disable-web-security');
-
-const DESKTOP_UA =
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
-    '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+function safeParseUrl(raw) {
+    try { return new URL(raw); } catch { return null; }
+}
 
 function createWindow() {
     mainWindow = new BrowserWindow({
@@ -35,192 +33,210 @@ function createWindow() {
             preload: path.join(__dirname, 'preload.js'),
             nodeIntegration: false,
             contextIsolation: true,
-            plugins: true, // ✅ Enable plugins for Widevine
+            sandbox: true, // rekomendasi security Electron [page:3]
         }
     });
 
     mainWindow.loadFile('index.html');
 
-    mainWindow.on('resize', () => {
-        updateViewBounds();
-    });
-
+    mainWindow.on('resize', updateViewBounds);
     mainWindow.on('closed', () => {
         views.clear();
+        mainWindow = null;
+    });
+
+    // Batasi window.open dari renderer UI (index.html) juga
+    mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+        // UI lokal seharusnya gak bikin popup random. Deny by default. [page:3]
+        return { action: 'deny' };
     });
 }
 
 function updateViewBounds() {
-    if (!mainWindow) return;
+    if (!mainWindow || activeViewId === null) return;
 
     const bounds = mainWindow.getContentBounds();
     const view = views.get(activeViewId);
-
-    if (view) {
-        const topOffset = 110;
-        const sideMargin = 10;
-
-        view.setBounds({
-            x: sideMargin,
-            y: topOffset,
-            width: bounds.width - (sideMargin * 2),
-            height: bounds.height - topOffset - sideMargin
-        });
-    }
-}
-
-function updateNavigationState(tabId, view) {
     if (!view) return;
 
-    const navHistory = view.webContents.navigationHistory;
+    const topOffset = 110;
+    const sideMargin = 10;
 
-    mainWindow.webContents.send('navigation-state', {
-        tabId,
-        canGoBack: navHistory.canGoBack(),
-        canGoForward: navHistory.canGoForward()
+    view.setBounds({
+        x: sideMargin,
+        y: topOffset,
+        width: bounds.width - (sideMargin * 2),
+        height: bounds.height - topOffset - sideMargin
     });
 }
 
-// ✅ IPC: Create BrowserView
-ipcMain.on('create-view', (event, tabId, url) => {
+function updateNavigationState(tabId, view) {
+    if (!mainWindow || !view) return;
+
+    // Catatan: navigationHistory itu bukan API resmi di semua versi Electron;
+    // tapi kamu sudah pakai. Kalau suatu saat error, ganti ke canGoBack()/canGoForward().
+    mainWindow.webContents.send('navigation-state', {
+        tabId,
+        canGoBack: view.webContents.canGoBack(),
+        canGoForward: view.webContents.canGoForward()
+    });
+}
+
+function installSessionGuards(ses) {
+    // Permission handler: default deny, allow yang perlu saja. [page:2][page:3]
+    ses.setPermissionRequestHandler((webContents, permission, callback, details) => {
+        const wcUrl = webContents.getURL();
+        const parsed = safeParseUrl(wcUrl);
+        const host = parsed?.hostname || '';
+
+        const allowList = new Set(['media', 'audioCapture', 'videoCapture', 'mediaKeySystem']);
+        if (!allowList.has(permission)) return callback(false);
+
+        // Contoh kebijakan: media hanya untuk origin https
+        if (parsed?.protocol !== 'https:') return callback(false);
+
+        // Silakan ubah ini sesuai kebutuhanmu:
+        // - jika mau super ketat: hanya allow media untuk domain tertentu.
+        callback(true);
+    });
+
+    // Permission check handler biar konsisten (Electron docs menyarankan implement dua-duanya) [page:2]
+    ses.setPermissionCheckHandler((_webContents, permission, requestingOrigin) => {
+        const parsed = safeParseUrl(requestingOrigin);
+        if (!parsed || parsed.protocol !== 'https:') return false;
+
+        const allowList = new Set(['media', 'audioCapture', 'videoCapture', 'mediaKeySystem']);
+        return allowList.has(permission);
+    });
+}
+
+const loadingPollers = new Map(); // tabId -> intervalId
+
+function startLoadingPoll(tabId, view) {
+    stopLoadingPoll(tabId);
+
+    const tick = () => {
+        if (!mainWindow || !view || view.webContents.isDestroyed()) {
+            stopLoadingPoll(tabId);
+            return;
+        }
+
+        const waiting = view.webContents.isWaitingForResponse(); // nunggu respon pertama [web:167]
+        const loading = view.webContents.isLoading();            // masih loading resource [web:66]
+
+        if (waiting || loading) {
+            mainWindow.webContents.send('loading-start', { tabId });
+        } else {
+            mainWindow.webContents.send('loading-stop', { tabId });
+            stopLoadingPoll(tabId);
+        }
+    };
+
+    // langsung cek sekali biar instan
+    tick();
+    const id = setInterval(tick, 100);
+    loadingPollers.set(tabId, id);
+}
+
+function stopLoadingPoll(tabId) {
+    const id = loadingPollers.get(tabId);
+    if (id) clearInterval(id);
+    loadingPollers.delete(tabId);
+}
+
+
+function createBrowserView(tabId, url) {
+    const parsed = safeParseUrl(url);
+    const isGoogle = parsed ? isGoogleHost(parsed.hostname) : false;
+
+    const partition = isGoogle ? 'persist:google' : 'persist:default';
+    const ses = session.fromPartition(partition); // persist session sesuai docs [page:2]
+
+    installSessionGuards(ses);
+
     const view = new BrowserView({
         webPreferences: {
             nodeIntegration: false,
             contextIsolation: true,
-            plugins: true, // ✅ Enable plugins for DRM
+            sandbox: true,
+            partition,
+            // plugins: true // kalau gak wajib, mending jangan dinyalain (attack surface)
         }
     });
 
-    // ✅ Spotify-specific User Agent
-    const spotifyUA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+    // Jangan clearStorageData setiap bikin view Google.
+    // Itu bikin login/consent loop & risk score makin tinggi.
 
-    if (url.includes('spotify.com')) {
-        view.webContents.setUserAgent(spotifyUA);
-    } else {
-        view.webContents.setUserAgent(DESKTOP_UA);
-    }
+    // Window open handler: untuk login Google, lempar ke browser eksternal (paling kompatibel)
+    view.webContents.setWindowOpenHandler(({ url: popupUrl }) => {
+        const p = safeParseUrl(popupUrl);
+        if (!p) return { action: 'deny' };
 
-    // ✅ Grant permissions BEFORE loading URL
-    view.webContents.session.setPermissionRequestHandler((webContents, permission, callback) => {
-        const allowedPermissions = ['media', 'audioCapture', 'videoCapture', 'mediaKeySystem'];
-        if (allowedPermissions.includes(permission)) {
-            console.log('✅ Granted permission:', permission);
-            callback(true);
-        } else {
-            callback(false);
+        const popupIsGoogle = isGoogleHost(p.hostname);
+
+        // Kalau Google account / oauth popup → buka external browser
+        if (popupIsGoogle && p.pathname.includes('ServiceLogin')) {
+            shell.openExternal(popupUrl);
+            return { action: 'deny' };
         }
+        if (popupIsGoogle && p.hostname === 'accounts.google.com') {
+            shell.openExternal(popupUrl);
+            return { action: 'deny' };
+        }
+
+        // Selain itu: bikin tab baru di app (lebih aman daripada allow popup)
+        mainWindow?.webContents.send('open-url-in-new-tab', popupUrl);
+        return { action: 'deny' };
     });
 
-    view.webContents.loadURL(url);
-
-    // ✅ Error handler
-    view.webContents.on('did-fail-load', (event, errorCode, errorDescription, validatedURL) => {
-        if (errorCode === -3) return;
-
-        console.log(`Failed to load: ${validatedURL} - ${errorDescription} (${errorCode})`);
-
-        const errorHTML = `
-            <!DOCTYPE html>
-            <html>
-            <head>
-                <meta charset="UTF-8">
-                <style>
-                    * { margin: 0; padding: 0; box-sizing: border-box; }
-                    body {
-                        font-family: 'Segoe UI', Tahoma, sans-serif;
-                        display: flex;
-                        justify-content: center;
-                        align-items: center;
-                        height: 100vh;
-                        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                    }
-                    .error-container {
-                        text-align: center;
-                        max-width: 500px;
-                        padding: 40px;
-                        background: white;
-                        border-radius: 12px;
-                        box-shadow: 0 10px 40px rgba(0,0,0,0.2);
-                    }
-                    h1 { color: #d32f2f; margin-bottom: 15px; font-size: 28px; }
-                    .emoji { font-size: 64px; margin-bottom: 20px; }
-                    .error-code { 
-                        color: #666; 
-                        font-size: 13px; 
-                        margin-bottom: 20px;
-                        font-family: 'Courier New', monospace;
-                        background: #fff3cd;
-                        padding: 10px;
-                        border-radius: 6px;
-                    }
-                    .error-url { 
-                        color: #0078d4; 
-                        word-break: break-all; 
-                        background: #f5f5f5;
-                        padding: 12px;
-                        border-radius: 6px;
-                        margin: 20px 0;
-                        font-size: 13px;
-                    }
-                    p { color: #555; line-height: 1.8; margin-bottom: 15px; }
-                    ul { text-align: left; color: #666; padding-left: 20px; }
-                    li { margin: 8px 0; }
-                </style>
-            </head>
-            <body>
-                <div class="error-container">
-                    <div class="emoji">⚠️</div>
-                    <h1>Unable to Load Page</h1>
-                    <div class="error-code">${errorDescription} (Code: ${errorCode})</div>
-                    <div class="error-url">${validatedURL}</div>
-                    <p><strong>Possible causes:</strong></p>
-                    <ul>
-                        <li>Internet connection lost</li>
-                        <li>Website blocked by Internet Positif</li>
-                        <li>Invalid URL or website not found</li>
-                        <li>SSL/TLS certificate error</li>
-                    </ul>
-                </div>
-            </body>
-            </html>
-        `;
-
-        view.webContents.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(errorHTML)}`);
+    // Limit navigation: cuma http/https. (punyamu udah ada, ini versi rapih)
+    view.webContents.on('will-navigate', (event, navigationUrl) => {
+        const p = safeParseUrl(navigationUrl);
+        if (!p) return event.preventDefault();
+        if (p.protocol !== 'http:' && p.protocol !== 'https:') event.preventDefault();
     });
 
-    // ✅ Update UA on navigate
-    view.webContents.on('will-navigate', (e, navUrl) => {
-        if (navUrl.includes('spotify.com')) {
-            view.webContents.setUserAgent(spotifyUA);
-        }
-    });
-
-    view.webContents.on('did-navigate', (e, navUrl) => {
-        if (navUrl.includes('spotify.com')) {
-            view.webContents.setUserAgent(spotifyUA);
-        }
-        mainWindow.webContents.send('url-change', { tabId, url: navUrl });
+    // Events UI sync
+    view.webContents.on('did-navigate', (_e, navUrl) => {
+        mainWindow?.webContents.send('url-change', { tabId, url: navUrl });
         updateNavigationState(tabId, view);
     });
 
-    view.webContents.on('did-navigate-in-page', (e, navUrl) => {
-        mainWindow.webContents.send('url-change', { tabId, url: navUrl });
+    view.webContents.on('did-navigate-in-page', (_e, navUrl) => {
+        mainWindow?.webContents.send('url-change', { tabId, url: navUrl });
     });
 
-    view.webContents.on('page-title-updated', (e, title) => {
-        mainWindow.webContents.send('title-change', { tabId, title });
+    view.webContents.on('page-title-updated', (_e, title) => {
+        mainWindow?.webContents.send('title-change', { tabId, title });
+    });
+
+    view.webContents.on('did-start-navigation', (event, navUrl, isInPlace, isMainFrame) => {
+        if (!isMainFrame) return;
+        // nyala dari awal dan keep nyala selama waiting/loading
+        startLoadingPoll(tabId, view);
     });
 
     view.webContents.on('did-start-loading', () => {
-        mainWindow.webContents.send('loading-start', { tabId });
+        // fallback: kalau ada load yang bukan navigation (misal reload)
+        startLoadingPoll(tabId, view);
     });
 
     view.webContents.on('did-stop-loading', () => {
-        mainWindow.webContents.send('loading-stop', { tabId });
+        mainWindow?.webContents.send('loading-stop', { tabId });
+        stopLoadingPoll(tabId);
         updateNavigationState(tabId, view);
     });
 
-    // ✅ Context menu
+    view.webContents.on('did-fail-load', (event, errorCode, errorDescription, validatedURL) => {
+        if (errorCode === -3) return;
+        mainWindow?.webContents.send('loading-stop', { tabId });
+        stopLoadingPoll(tabId);
+        loadErrorPage(view, { /* ...punyamu... */ });
+    });
+
+
+
+    // Context menu (punyamu oke; tetap local UI yang trigger, aman)
     view.webContents.on('context-menu', (e, params) => {
         const hasLink = !!params.linkURL;
         const hasSelection = !!(params.selectionText && params.selectionText.trim().length > 0);
@@ -229,30 +245,29 @@ ipcMain.on('create-view', (event, tabId, url) => {
             {
                 label: 'Buka di tab baru',
                 visible: hasLink,
-                click: () => mainWindow.webContents.send('ctx-open-in-new-tab', params.linkURL)
+                click: () => mainWindow?.webContents.send('ctx-open-in-new-tab', params.linkURL)
             },
             {
-                label: 'Buka di jendela baru',
+                label: 'Buka di jendela baru (browser default)',
                 visible: hasLink,
-                click: () => mainWindow.webContents.send('ctx-open-in-new-window', params.linkURL)
+                click: () => {
+                    // Jangan langsung openExternal untuk URL aneh; minimal cek http/https dulu. [page:3]
+                    const p = safeParseUrl(params.linkURL);
+                    if (p && (p.protocol === 'http:' || p.protocol === 'https:')) shell.openExternal(params.linkURL);
+                }
             },
-            {
-                type: 'separator',
-                visible: hasLink || hasSelection
-            },
+            { type: 'separator', visible: hasLink || hasSelection },
             {
                 label: 'Terjemahkan dengan Google Translate',
                 visible: hasSelection,
-                click: () => mainWindow.webContents.send('ctx-translate-selection', params.selectionText)
+                click: () => mainWindow?.webContents.send('ctx-translate-selection', params.selectionText)
             },
             { type: 'separator' },
             {
                 label: 'Inspect Element',
                 click: () => {
                     view.webContents.inspectElement(params.x, params.y);
-                    if (!view.webContents.isDevToolsOpened()) {
-                        view.webContents.openDevTools({ mode: 'bottom' });
-                    }
+                    if (!view.webContents.isDevToolsOpened()) view.webContents.openDevTools({ mode: 'bottom' });
                 }
             },
             { type: 'separator' },
@@ -261,35 +276,81 @@ ipcMain.on('create-view', (event, tabId, url) => {
             { role: 'selectAll' }
         ];
 
-        const menu = Menu.buildFromTemplate(template);
-        menu.popup({ window: mainWindow });
+        Menu.buildFromTemplate(template).popup({ window: mainWindow });
     });
 
-    // ✅ Window open handler
-    view.webContents.setWindowOpenHandler((details) => {
-        const url = details.url || '';
+    view.webContents.loadURL(url);
+    return view;
+}
 
-        if (url.includes('steamunlocked') || url.includes('uploadhaven.com')) {
-            return { action: 'allow' };
-        }
+function loadErrorPage(view, {
+    title = 'Unable to Load Page',
+    subtitle = 'An error occurred while loading the page.',
+    url = '',
+    errorCode = '',
+    errorDescription = '',
+    tips = [],
+} = {}) {
+    const safeUrl = String(url || '');
+    const safeDesc = String(errorDescription || '');
+    const safeCode = String(errorCode || '');
 
-        mainWindow.webContents.send('open-url-in-new-tab', url);
-        return { action: 'deny' };
-    });
+    const tipsHtml = tips.map(t => `<li>${String(t)}</li>`).join('');
 
+    const errorHTML = `
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline';">
+  <style>
+    *{box-sizing:border-box} body{margin:0;font-family:Segoe UI,Tahoma,sans-serif;background:#0b1220;color:#e5e7eb}
+    .wrap{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px}
+    .card{max-width:720px;width:100%;background:#111827;border:1px solid #1f2937;border-radius:14px;padding:22px}
+    h1{margin:0 0 8px;font-size:22px} p{margin:6px 0;color:#cbd5e1;line-height:1.6}
+    .meta{margin-top:14px;padding:12px;border-radius:10px;background:#0b1020;border:1px solid #1f2937;font-family:Consolas,monospace;font-size:12px;color:#d1d5db}
+    ul{margin:10px 0 0 18px;color:#cbd5e1}
+    .btnrow{display:flex;gap:10px;margin-top:16px;flex-wrap:wrap}
+    button{cursor:pointer;border:1px solid #374151;background:#1f2937;color:#e5e7eb;padding:10px 12px;border-radius:10px}
+    button:hover{background:#243041}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1>${title}</h1>
+      <p>${subtitle}</p>
+
+      <div class="meta">
+        URL: ${safeUrl}<br/>
+        Error: ${safeDesc}<br/>
+        Code: ${safeCode}
+      </div>
+
+      ${tips.length ? `<p><b>Possible causes:</b></p><ul>${tipsHtml}</ul>` : ''}
+    </div>
+  </div>
+</body>
+</html>`;
+
+    view.webContents.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(errorHTML)}`);
+}
+
+
+// IPC: Create BrowserView
+ipcMain.on('create-view', (_event, tabId, url) => {
+    const view = createBrowserView(tabId, url);
     views.set(tabId, view);
 });
 
-// ✅ IPC: Set active view
-ipcMain.on('set-active-view', (event, tabId) => {
+// Switch view
+ipcMain.on('set-active-view', (_event, tabId) => {
     const view = views.get(tabId);
-    if (!view) return;
+    if (!view || !mainWindow) return;
 
     if (activeViewId !== null) {
         const oldView = views.get(activeViewId);
-        if (oldView) {
-            mainWindow.removeBrowserView(oldView);
-        }
+        if (oldView) mainWindow.removeBrowserView(oldView);
     }
 
     mainWindow.setBrowserView(view);
@@ -298,183 +359,110 @@ ipcMain.on('set-active-view', (event, tabId) => {
     updateNavigationState(tabId, view);
 });
 
-// ✅ IPC: Destroy view
-ipcMain.on('destroy-view', (event, tabId) => {
+ipcMain.on('destroy-view', (_event, tabId) => {
     const view = views.get(tabId);
-    if (view) {
+    if (view && mainWindow) {
         mainWindow.removeBrowserView(view);
         view.webContents.destroy();
         views.delete(tabId);
     }
+    if (activeViewId === tabId) activeViewId = null;
 
-    if (activeViewId === tabId) {
-        activeViewId = null;
-    }
+    stopLoadingPoll(tabId);
+
 });
 
-// ✅ IPC: Load URL
-ipcMain.on('load-url', (event, tabId, url) => {
+ipcMain.on('load-url', (_event, tabId, url) => {
     const view = views.get(tabId);
     if (view) view.webContents.loadURL(url);
 });
 
-// ✅ IPC: Go Back
-ipcMain.on('go-back', (event, tabId) => {
+ipcMain.on('go-back', (_event, tabId) => {
     const view = views.get(tabId);
-    if (view) {
-        const navHistory = view.webContents.navigationHistory;
-        if (navHistory.canGoBack()) {
-            view.webContents.goBack();
-        }
-    }
+    if (view && view.webContents.canGoBack()) view.webContents.goBack();
 });
 
-// ✅ IPC: Go Forward
-ipcMain.on('go-forward', (event, tabId) => {
+ipcMain.on('go-forward', (_event, tabId) => {
     const view = views.get(tabId);
-    if (view) {
-        const navHistory = view.webContents.navigationHistory;
-        if (navHistory.canGoForward()) {
-            view.webContents.goForward();
-        }
-    }
+    if (view && view.webContents.canGoForward()) view.webContents.goForward();
 });
 
-// ✅ IPC: Reload
-ipcMain.on('reload', (event, tabId) => {
+ipcMain.on('reload', (_event, tabId) => {
     const view = views.get(tabId);
     if (view) view.webContents.reload();
 });
 
-// ✅ IPC: DevTools
-ipcMain.on('toggle-devtools', (event, tabId) => {
+ipcMain.on('toggle-devtools', (_event, tabId) => {
     const view = views.get(tabId);
     if (!view) return;
+    if (view.webContents.isDevToolsOpened()) view.webContents.closeDevTools();
+    else view.webContents.openDevTools({ mode: 'bottom' });
+});
 
-    if (view.webContents.isDevToolsOpened()) {
-        view.webContents.closeDevTools();
-    } else {
-        view.webContents.openDevTools({ mode: 'bottom' });
+ipcMain.on('hide-view', () => {
+    if (!mainWindow || activeViewId === null) return;
+    const view = views.get(activeViewId);
+    if (view) mainWindow.removeBrowserView(view);
+});
+
+ipcMain.on('show-view', () => {
+    if (!mainWindow || activeViewId === null) return;
+    const view = views.get(activeViewId);
+    if (view) {
+        mainWindow.setBrowserView(view);
+        updateViewBounds();
     }
 });
 
-// ✅ IPC: Hide/Show view
-ipcMain.on('hide-view', (event) => {
-    if (activeViewId !== null) {
-        const view = views.get(activeViewId);
-        if (view) {
-            mainWindow.removeBrowserView(view);
-        }
-    }
-});
+// App lifecycle
+app.whenReady().then(async () => {
+    // 1) Reset & pakai proxy sistem (biar ngikut WARP)
+    await session.defaultSession.forceReloadProxyConfig(); // reset internal state [web:36]
+    await session.defaultSession.setProxy({ mode: 'system' }); // ikut OS [web:126]
 
-ipcMain.on('show-view', (event) => {
-    if (activeViewId !== null) {
-        const view = views.get(activeViewId);
-        if (view) {
-            mainWindow.setBrowserView(view);
-            updateViewBounds();
-        }
-    }
-});
+    // 2) Lakukan juga untuk partition yang kamu pakai
+    const sesDefault = session.fromPartition('persist:default');
+    await sesDefault.forceReloadProxyConfig(); // [web:36]
+    await sesDefault.setProxy({ mode: 'system' }); // [web:126]
 
-// ✅ Security handlers
-app.on('web-contents-created', (event, contents) => {
-    // ✅ Grant media permissions globally
-    contents.session.setPermissionRequestHandler((webContents, permission, callback) => {
-        const allowedPermissions = ['media', 'audioCapture', 'videoCapture', 'mediaKeySystem'];
-        if (allowedPermissions.includes(permission)) {
-            console.log('✅ Global permission granted:', permission);
-            callback(true);
-        } else {
-            callback(false);
-        }
-    });
-
-    contents.on('will-navigate', (event, navigationUrl) => {
-        try {
-            const parsedUrl = new URL(navigationUrl);
-            if (parsedUrl.protocol !== 'http:' && parsedUrl.protocol !== 'https:') {
-                console.log('Blocked navigation to:', navigationUrl);
-                event.preventDefault();
-            }
-        } catch (e) {
-            console.error('URL parse error:', e);
-            event.preventDefault();
-        }
-    });
-
-    contents.setWindowOpenHandler(({ url }) => {
-        if (url.startsWith('http:') || url.startsWith('https:')) {
-            return { action: 'allow' };
-        }
-        return { action: 'deny' };
-    });
-});
-
-// ✅ Widevine ready events
-app.on('widevine-ready', (version, lastVersion) => {
-    console.log('✅ Widevine CDM ready');
-    console.log('Version:', version);
-    console.log('Last version:', lastVersion);
-});
-
-app.on('widevine-update-pending', (currentVersion, pendingVersion) => {
-    console.log('⏳ Widevine update pending');
-    console.log('Current:', currentVersion, '→ Pending:', pendingVersion);
-});
-
-app.on('widevine-error', (error) => {
-    console.error('❌ Widevine error:', error);
-});
-
-// ✅ App ready
-app.whenReady().then(() => {
-    const { session } = require('electron');
-
-    app.userAgentFallback = DESKTOP_UA;
-
-    console.log('Electron:', process.versions.electron);
-    console.log('Chrome:', process.versions.chrome);
-
-    // ✅ Intercept ALL Spotify requests
-    session.defaultSession.webRequest.onBeforeSendHeaders(
-        { urls: ['https://api.spotify.com/*', 'https://*.spotify.com/*', 'https://spclient.wg.spotify.com/*'] },
-        (details, callback) => {
-            // Override headers to match Chrome exactly
-            details.requestHeaders['User-Agent'] = DESKTOP_UA;
-            details.requestHeaders['sec-ch-ua'] = '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"';
-            details.requestHeaders['sec-ch-ua-mobile'] = '?0';
-            details.requestHeaders['sec-ch-ua-platform'] = '"Windows"';
-            details.requestHeaders['Origin'] = 'https://open.spotify.com';
-
-            callback({ requestHeaders: details.requestHeaders });
-        }
-    );
-
-    // ✅ Log Spotify API responses for debugging
-    session.defaultSession.webRequest.onHeadersReceived(
-        { urls: ['https://api.spotify.com/*', 'https://spclient.wg.spotify.com/*'] },
-        (details, callback) => {
-            if (details.statusCode !== 200) {
-                console.log('⚠️ Spotify API response:', details.url, 'Status:', details.statusCode);
-            }
-            callback({ cancel: false });
-        }
-    );
-
-    // ✅ Certificate bypass
-    session.defaultSession.setCertificateVerifyProc((request, callback) => {
-        callback(0);
-    });
+    const sesGoogle = session.fromPartition('persist:google');
+    await sesGoogle.forceReloadProxyConfig(); // [web:36]
+    await sesGoogle.setProxy({ mode: 'system' }); // [web:126]
 
     createWindow();
+
+    app.on('activate', () => {
+        if (BrowserWindow.getAllWindows().length === 0) createWindow();
+    });
+
+    app.on('certificate-error', (event, webContents, url, error, certificate, callback) => {
+        // Default Electron: block. Kita pertahankan block (callback(false)),
+        // tapi kita tampilkan error page biar user paham. [web:56]
+        event.preventDefault();
+        callback(false);
+
+        // Tampilkan halaman error di tab itu (kalau masih hidup)
+        try {
+            const view = BrowserView.fromWebContents(webContents);
+            if (view) {
+                loadErrorPage(view, {
+                    title: 'SSL/TLS Certificate Error',
+                    subtitle: "The site's certificate is invalid. This often occurs because the network/ISP is intercepting it or the site is experiencing issues.",
+                    url,
+                    errorCode: error,
+                    errorDescription: error,
+                    tips: [
+                        'Try turning on a VPN/changing networks.',
+                        'Check if your proxy/antivirus is running HTTPS scanning.',
+                        'Do not proceed if this is an important login/account page.'
+                    ]
+                });
+            }
+        } catch (_) { }
+    });
+
 });
 
 app.on('window-all-closed', () => {
     if (process.platform !== 'darwin') app.quit();
-});
-
-app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow();
 });

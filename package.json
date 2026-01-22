@@ -33,6 +33,7 @@
   "build": {
     "appId": "com.indo.browser",
     "productName": "Indo Browser",
+    "copyright": "Copyright © 2026 ${author}",
     "compression": "normal",
     "electronDist": "electron-cache",
     "electronVersion": "33.2.1+wvcus",
@@ -41,17 +42,28 @@
       "preload.js",
       "renderer.js",
       "index.html",
-      "history.json",
-      "icon.ico"
+      "styles.css",
+      "icon.ico",
+      "icon.png"
     ],
     "win": {
       "target": [
-        "nsis",
-        "portable"
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
       ],
       "icon": "icon.ico",
-      "sign": null,
-      "signingHashAlgorithms": []
+      "requestedExecutionLevel": "asInvoker",
+      "artifactName": "${productName}-${version}-${os}-${arch}.${ext}"
     },
     "nsis": {
       "oneClick": false,

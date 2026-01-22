@@ -139,12 +139,26 @@
             padding: 20px 40px;
             border-radius: 8px;
             font-size: 16px;
-            z-index: 1000;
+            z-index: 1000000;
         }
 
         .loading-indicator.show {
             display: block;
         }
+
+        #loading {
+            position: absolute;
+            top: 70px;
+            /* < 110 */
+            right: 20px;
+            z-index: 9999;
+            display: none;
+        }
+
+        #loading.show {
+            display: block;
+        }
+
 
         .history-overlay {
             position: fixed;
