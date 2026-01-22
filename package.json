@@ -33,19 +33,9 @@
   "build": {
     "appId": "com.indo.browser",
     "productName": "Indo Browser",
-    "copyright": "Copyright © 2026 ${author}",
     "compression": "normal",
     "electronDist": "electron-cache",
     "electronVersion": "33.2.1+wvcus",
-    "files": [
-      "main.js",
-      "preload.js",
-      "renderer.js",
-      "index.html",
-      "styles.css",
-      "icon.ico",
-      "icon.png"
-    ],
     "win": {
       "target": [
         {
@@ -62,24 +52,18 @@
         }
       ],
       "icon": "icon.ico",
-      "requestedExecutionLevel": "asInvoker",
-      "artifactName": "${productName}-${version}-${os}-${arch}.${ext}"
+      "requestedExecutionLevel": "asInvoker"
     },
     "nsis": {
+      "artifactName": "${productName}-Setup-${version}-${arch}.${ext}",
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
       "differentialPackage": false
     },
     "portable": {
+      "artifactName": "${productName}-Portable-${version}-${arch}.${ext}",
       "useZip": false
     }
-  },
-  "devDependencies": {
-    "electron": "github:castlabs/electron-releases#v33.2.1+wvcus",
-    "electron-builder": "^24.13.3"
-  },
-  "dependencies": {
-    "node-fetch": "^2.7.0"
   }
 }

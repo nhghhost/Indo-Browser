@@ -1,13 +1,11 @@
 const { app, BrowserWindow, BrowserView, Menu, ipcMain, shell, session } = require('electron');
 const path = require('path');
+const AUTH_PARTITION = 'persist:default'; // samakan dengan yang dipakai BrowserView
+
 
 let mainWindow;
 const views = new Map();
 let activeViewId = null;
-
-// Catatan:
-// - HAPUS total: ignore-certificate-errors, setCertificateVerifyProc(callback(0)), dan spoofing header sec-ch-ua.
-// - Biarkan TLS verify normal (default) supaya situs login (Google) percaya. [page:3]
 
 function isGoogleHost(hostname) {
     return (
@@ -19,6 +17,27 @@ function isGoogleHost(hostname) {
         hostname.endsWith('.googleusercontent.com')
     );
 }
+
+function isXHost(h) {
+    return h === 'x.com' || h.endsWith('.x.com') || h === 'twitter.com' || h.endsWith('.twitter.com');
+}
+
+function openAuthWindow(url, partition) {
+    const authWin = new BrowserWindow({
+        width: 520,
+        height: 760,
+        parent: mainWindow,
+        webPreferences: {
+            partition,            // <-- pakai partition tab sumber
+            sandbox: true,
+            contextIsolation: true,
+            nodeIntegration: false,
+        }
+    });
+    authWin.loadURL(url);
+    return authWin;
+}
+
 
 function safeParseUrl(raw) {
     try { return new URL(raw); } catch { return null; }
@@ -108,6 +127,19 @@ function installSessionGuards(ses) {
         const allowList = new Set(['media', 'audioCapture', 'videoCapture', 'mediaKeySystem']);
         return allowList.has(permission);
     });
+
+    ses.webRequest.onErrorOccurred((details) => {
+        // filter biar gak spam
+        if (details.url.includes('api.x.com') || details.url.includes('x.com')) {
+            console.log('[NET-ERROR]', {
+                url: details.url,
+                error: details.error,
+                method: details.method,
+                resourceType: details.resourceType,
+                fromCache: details.fromCache,
+            });
+        }
+    });
 }
 
 const loadingPollers = new Map(); // tabId -> intervalId
@@ -144,6 +176,21 @@ function stopLoadingPoll(tabId) {
     loadingPollers.delete(tabId);
 }
 
+function guessTitle(errorDescription) {
+    if (!errorDescription) return 'Unable to Load Page';
+    if (errorDescription.includes('ERR_CERT')) return 'SSL/TLS Certificate Error';
+    if (errorDescription.includes('ERR_CONNECTION_RESET')) return 'Connection Reset';
+    return 'Unable to Load Page';
+}
+
+function guessSubtitle(errorDescription) {
+    if (!errorDescription) return 'An error occurred while loading the page.';
+    if (errorDescription.includes('ERR_CERT')) return "The site's certificate is invalid or intercepted.";
+    if (errorDescription.includes('ERR_CONNECTION_RESET')) return 'The network closed the connection unexpectedly.';
+    return 'An error occurred while loading the page.';
+}
+
+
 
 function createBrowserView(tabId, url) {
     const parsed = safeParseUrl(url);
@@ -172,16 +219,19 @@ function createBrowserView(tabId, url) {
         const p = safeParseUrl(popupUrl);
         if (!p) return { action: 'deny' };
 
+        if (isXHost(p.hostname)) {
+            openAuthWindow(popupUrl, partition);
+            return { action: 'deny' };
+        }
+
         const popupIsGoogle = isGoogleHost(p.hostname);
 
         // Kalau Google account / oauth popup → buka external browser
         if (popupIsGoogle && p.pathname.includes('ServiceLogin')) {
-            shell.openExternal(popupUrl);
-            return { action: 'deny' };
+            return { action: 'allow' };
         }
         if (popupIsGoogle && p.hostname === 'accounts.google.com') {
-            shell.openExternal(popupUrl);
-            return { action: 'deny' };
+            return { action: 'allow' };
         }
 
         // Selain itu: bikin tab baru di app (lebih aman daripada allow popup)
@@ -227,11 +277,25 @@ function createBrowserView(tabId, url) {
         updateNavigationState(tabId, view);
     });
 
-    view.webContents.on('did-fail-load', (event, errorCode, errorDescription, validatedURL) => {
+    view.webContents.on('did-fail-load', (event, errorCode, errorDescription, validatedURL, isMainFrame) => {
         if (errorCode === -3) return;
+
         mainWindow?.webContents.send('loading-stop', { tabId });
         stopLoadingPoll(tabId);
-        loadErrorPage(view, { /* ...punyamu... */ });
+
+        loadErrorPage(view, {
+            title: guessTitle(errorDescription),
+            subtitle: guessSubtitle(errorDescription),
+            url: validatedURL,
+            errorCode: String(errorCode),
+            errorDescription,
+            tips: [
+                'Try turning on a VPN/changing networks.',
+                'Check if your proxy/antivirus is running HTTPS scanning.',
+                'Do not proceed if this is an important login/account page.',
+                'Make sure the site is valid'
+            ]
+        });
     });
 
 
@@ -327,7 +391,7 @@ function loadErrorPage(view, {
         Code: ${safeCode}
       </div>
 
-      ${tips.length ? `<p><b>Possible causes:</b></p><ul>${tipsHtml}</ul>` : ''}
+      ${tips.length ? `<p><b>Tips:</b></p><ul>${tipsHtml}</ul>` : ''}
     </div>
   </div>
 </body>
@@ -414,20 +478,32 @@ ipcMain.on('show-view', () => {
     }
 });
 
+function installNetworkDebug(ses) {
+    ses.webRequest.onErrorOccurred((details) => {
+        if (details.url.includes('api.x.com') || details.url.includes('x.com')) {
+            console.log('[NET-ERROR]', details.url, details.error);
+        }
+    });
+}
+
+
 // App lifecycle
 app.whenReady().then(async () => {
     // 1) Reset & pakai proxy sistem (biar ngikut WARP)
     await session.defaultSession.forceReloadProxyConfig(); // reset internal state [web:36]
-    await session.defaultSession.setProxy({ mode: 'system' }); // ikut OS [web:126]
+    // await session.defaultSession.setProxy({ mode: 'system' }); // ikut OS [web:126]
 
     // 2) Lakukan juga untuk partition yang kamu pakai
     const sesDefault = session.fromPartition('persist:default');
+
+    installNetworkDebug(sesDefault);
+
     await sesDefault.forceReloadProxyConfig(); // [web:36]
-    await sesDefault.setProxy({ mode: 'system' }); // [web:126]
+    // await sesDefault.setProxy({ mode: 'direct' }); // [web:126]
 
     const sesGoogle = session.fromPartition('persist:google');
     await sesGoogle.forceReloadProxyConfig(); // [web:36]
-    await sesGoogle.setProxy({ mode: 'system' }); // [web:126]
+    // await sesGoogle.setProxy({ mode: 'system' }); // [web:126]
 
     createWindow();
 
@@ -436,9 +512,18 @@ app.whenReady().then(async () => {
     });
 
     app.on('certificate-error', (event, webContents, url, error, certificate, callback) => {
-        // Default Electron: block. Kita pertahankan block (callback(false)),
-        // tapi kita tampilkan error page biar user paham. [web:56]
-        event.preventDefault();
+        const u = new URL(url);
+        const hostname = u.hostname;
+        const isX =
+            hostname === 'api.x.com' || hostname.endsWith('.x.com') ||
+            hostname === 'x.com' || hostname.endsWith('.x.com');
+
+
+        if (isX) {
+            event.preventDefault();
+            return callback(true); // WARNING: tetap ada risiko MITM, tapi scope kecil
+        }
+
         callback(false);
 
         // Tampilkan halaman error di tab itu (kalau masih hidup)
